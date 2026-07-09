@@ -28,6 +28,7 @@
         let
           libPath = pkgs.lib.makeLibraryPath [
             pkgs.mpv
+            pkgs.libffi
           ];
         in
         {
@@ -37,6 +38,7 @@
               pkgs.sbcl
               pkgs.sbclPackages.cffi
               pkgs.mpv
+              pkgs.libffi
               pkgs.pkg-config
             ];
 
