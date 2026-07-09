@@ -1,7 +1,14 @@
 # cl-libmpv-cffi
-unofficial wrapper of libmpv for Common Lisp
+unofficial wrapper of libmpv for Common Lisp.  
 
-## Example
+tested only SBCL.
+
+## before usage
+``` shell
+ros install madosuki/cl-lbmpv-cffi
+```
+
+## Example Code
 
 ```lisp
 (ql:quickload :cl-libmpv-cffi)
@@ -30,3 +37,5 @@ For headless tests, use null outputs:
           (cl-libmpv-cffi:client-name player)
           (cl-libmpv-cffi:client-id player)))
 ```
+
+more detail here https://github.com/madosuki/cl-libmpv-cffi/blob/main/examples/run-loadfile.lisp
