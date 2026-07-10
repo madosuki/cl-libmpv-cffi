@@ -22,6 +22,20 @@
   ((handle :initarg :handle :accessor %player-handle)
    (destroyed-p :initform nil :accessor player-destroyed-p)))
 
+(defclass mpv-render-context ()
+  ((handle :initarg :handle :accessor %render-context-handle)
+   (player :initarg :player :reader render-context-player)
+   (callback-state :initarg :callback-state :accessor %render-callback-state)
+   (destroyed-p :initform nil :accessor render-context-destroyed-p)))
+
+(defclass %render-callback-state ()
+  ((get-proc-address :initarg :get-proc-address :reader %state-get-proc-address)
+   (render-context :initform nil :accessor %state-render-context)
+   (update-callback :initform nil :accessor %state-update-callback)))
+
+(defvar *render-callback-states* (make-hash-table :test 'eql))
+(defvar *next-render-callback-state-id* 0)
+
 (defun api-version ()
   "Return the libmpv client API version as an integer."
   (cl-libmpv-cffi.binding:mpv-client-api-version))
@@ -40,6 +54,12 @@
   (when (player-destroyed-p player)
     (error "The mpv player has already been destroyed."))
   (%player-handle player))
+
+(defun %ensure-render-context (render-context)
+  (check-type render-context mpv-render-context)
+  (when (render-context-destroyed-p render-context)
+    (error "The mpv render context has already been destroyed."))
+  (%render-context-handle render-context))
 
 (defun %normalize-string (value)
   (etypecase value
@@ -282,6 +302,256 @@ inside libmpv's event queue is exposed."
 (defun hook-continue (player id)
   (%check-error
    (cl-libmpv-cffi.binding:mpv-hook-continue (%ensure-player player) id)))
+
+(defun %register-render-callback-state (state)
+  (let ((id (incf *next-render-callback-state-id*)))
+    (setf (gethash id *render-callback-states*) state)
+    (cffi:make-pointer id)))
+
+(defun %unregister-render-callback-state (ptr)
+  (unless (cffi:null-pointer-p ptr)
+    (remhash (cffi:pointer-address ptr) *render-callback-states*))
+  nil)
+
+(defun %lookup-render-callback-state (ptr)
+  (unless (cffi:null-pointer-p ptr)
+    (gethash (cffi:pointer-address ptr) *render-callback-states*)))
+
+(defun %as-foreign-pointer (value)
+  (cond
+    ((null value) (cffi:null-pointer))
+    ((cffi:pointerp value) value)
+    ((integerp value) (cffi:make-pointer value))
+    (t (error "Expected a foreign pointer, pointer address, or NIL, got ~S."
+              value))))
+
+(cffi:defcallback %mpv-opengl-get-proc-address :pointer
+    ((ctx :pointer) (name :string))
+  (let ((state (%lookup-render-callback-state ctx)))
+    (if state
+        (%as-foreign-pointer (funcall (%state-get-proc-address state) name))
+        (cffi:null-pointer))))
+
+(cffi:defcallback %mpv-render-update-callback :void
+    ((ctx :pointer))
+  (let ((state (%lookup-render-callback-state ctx)))
+    (when state
+      (let ((callback (%state-update-callback state))
+            (render-context (%state-render-context state)))
+        (when (and callback render-context
+                   (not (render-context-destroyed-p render-context)))
+          (funcall callback render-context))))))
+
+(defun %render-param-pointer (params index)
+  (cffi:mem-aptr params '(:struct cl-libmpv-cffi.binding:mpv-render-param)
+                 index))
+
+(defun %set-render-param (params index type data)
+  (let ((param (%render-param-pointer params index)))
+    (setf (cffi:foreign-slot-value
+           param '(:struct cl-libmpv-cffi.binding:mpv-render-param)
+           'cl-libmpv-cffi.binding::type)
+          type
+          (cffi:foreign-slot-value
+           param '(:struct cl-libmpv-cffi.binding:mpv-render-param)
+           'cl-libmpv-cffi.binding::data)
+          data)))
+
+(defun %terminate-render-params (params index)
+  (%set-render-param params index :invalid (cffi:null-pointer)))
+
+(defun make-opengl-render-context (player get-proc-address
+                                   &key update-callback advanced-control)
+  "Create an mpv OpenGL render context for PLAYER.
+
+GET-PROC-ADDRESS is called with an OpenGL function name and must return a CFFI
+foreign pointer, a pointer address integer, or NIL. UPDATE-CALLBACK, when
+provided, is called with the render context when libmpv needs a redraw."
+  (let* ((handle (%ensure-player player))
+         (state (make-instance '%render-callback-state
+                               :get-proc-address get-proc-address))
+         (state-ptr (%register-render-callback-state state)))
+    (handler-case
+        (cffi:with-foreign-string
+            (api-type cl-libmpv-cffi.binding:+mpv-render-api-type-opengl+)
+          (cffi:with-foreign-object
+              (init-params
+               '(:struct cl-libmpv-cffi.binding:mpv-opengl-init-params))
+            (setf (cffi:foreign-slot-value
+                   init-params
+                   '(:struct cl-libmpv-cffi.binding:mpv-opengl-init-params)
+                   'cl-libmpv-cffi.binding::get-proc-address)
+                  (cffi:callback %mpv-opengl-get-proc-address)
+                  (cffi:foreign-slot-value
+                   init-params
+                   '(:struct cl-libmpv-cffi.binding:mpv-opengl-init-params)
+                   'cl-libmpv-cffi.binding::get-proc-address-ctx)
+                  state-ptr)
+            (cffi:with-foreign-object
+                (params
+                 '(:struct cl-libmpv-cffi.binding:mpv-render-param)
+                 (if advanced-control 4 3))
+              (cffi:with-foreign-object (context-ptr :pointer)
+                (%set-render-param params 0 :api-type api-type)
+                (%set-render-param params 1 :opengl-init-params init-params)
+                (if advanced-control
+                    (cffi:with-foreign-object (advanced :int)
+                      (setf (cffi:mem-ref advanced :int) 1)
+                      (%set-render-param params 2 :advanced-control advanced)
+                      (%terminate-render-params params 3)
+                      (%check-error
+                       (cl-libmpv-cffi.binding:mpv-render-context-create
+                        context-ptr handle params)))
+                    (progn
+                      (%terminate-render-params params 2)
+                      (%check-error
+                       (cl-libmpv-cffi.binding:mpv-render-context-create
+                        context-ptr handle params))))
+                (let ((render-context
+                        (make-instance
+                         'mpv-render-context
+                         :handle (cffi:mem-ref context-ptr :pointer)
+                         :player player
+                         :callback-state state-ptr)))
+                  (setf (%state-render-context state) render-context)
+                  (when update-callback
+                    (set-render-update-callback render-context
+                                                update-callback))
+                  render-context)))))
+      (error (condition)
+        (%unregister-render-callback-state state-ptr)
+        (error condition)))))
+
+(defmacro with-opengl-render-context ((var player get-proc-address &rest args)
+                                      &body body)
+  "Bind VAR to an OpenGL render context and free it on exit."
+  `(let ((,var (make-opengl-render-context ,player ,get-proc-address ,@args)))
+     (unwind-protect
+          (progn ,@body)
+       (unless (render-context-destroyed-p ,var)
+         (destroy-render-context ,var)))))
+
+(defun destroy-render-context (render-context)
+  (check-type render-context mpv-render-context)
+  (unless (render-context-destroyed-p render-context)
+    (cl-libmpv-cffi.binding:mpv-render-context-free
+     (%render-context-handle render-context))
+    (%unregister-render-callback-state
+     (%render-callback-state render-context))
+    (setf (render-context-destroyed-p render-context) t))
+  nil)
+
+(defun set-render-update-callback (render-context callback)
+  "Set CALLBACK to be called with RENDER-CONTEXT when libmpv requests redraw.
+
+Pass NIL to clear the callback."
+  (%ensure-render-context render-context)
+  (let* ((state-ptr (%render-callback-state render-context))
+         (state (%lookup-render-callback-state state-ptr)))
+    (setf (%state-update-callback state) callback)
+    (cl-libmpv-cffi.binding:mpv-render-context-set-update-callback
+     (%render-context-handle render-context)
+     (if callback
+         (cffi:callback %mpv-render-update-callback)
+         (cffi:null-pointer))
+     state-ptr))
+  callback)
+
+(defun render-context-update (render-context)
+  "Return the mpv render context update flag mask as an integer."
+  (cl-libmpv-cffi.binding:mpv-render-context-update
+   (%ensure-render-context render-context)))
+
+(defun render-context-next-frame-info (render-context)
+  "Return a plist with libmpv's next-frame-info flags and target time."
+  (cffi:with-foreign-object
+      (frame-info '(:struct cl-libmpv-cffi.binding:mpv-render-frame-info))
+    (cffi:with-foreign-object
+        (param '(:struct cl-libmpv-cffi.binding:mpv-render-param))
+      (setf (cffi:foreign-slot-value
+             param '(:struct cl-libmpv-cffi.binding:mpv-render-param)
+             'cl-libmpv-cffi.binding::type)
+            :next-frame-info
+            (cffi:foreign-slot-value
+             param '(:struct cl-libmpv-cffi.binding:mpv-render-param)
+             'cl-libmpv-cffi.binding::data)
+            frame-info)
+      (%check-error
+       (cl-libmpv-cffi.binding:mpv-render-context-get-info
+        (%ensure-render-context render-context)
+        param))
+      (list :flags (cffi:foreign-slot-value
+                    frame-info
+                    '(:struct cl-libmpv-cffi.binding:mpv-render-frame-info)
+                    'cl-libmpv-cffi.binding::flags)
+            :target-time (cffi:foreign-slot-value
+                          frame-info
+                          '(:struct
+                            cl-libmpv-cffi.binding:mpv-render-frame-info)
+                          'cl-libmpv-cffi.binding::target-time)))))
+
+(defun render-opengl (render-context width height
+                      &key (fbo 0) (internal-format 0) flip-y depth
+                        block-for-target-time skip-rendering)
+  "Render the next mpv frame into an OpenGL FBO.
+
+For GtkGLArea, call this from the render signal with the widget's allocated
+pixel WIDTH and HEIGHT. FBO defaults to 0, which is GtkGLArea's current
+framebuffer in the active GL context."
+  (cffi:with-foreign-object
+      (fbo-params '(:struct cl-libmpv-cffi.binding:mpv-opengl-fbo))
+    (setf (cffi:foreign-slot-value
+           fbo-params '(:struct cl-libmpv-cffi.binding:mpv-opengl-fbo)
+           'cl-libmpv-cffi.binding::fbo)
+          fbo
+          (cffi:foreign-slot-value
+           fbo-params '(:struct cl-libmpv-cffi.binding:mpv-opengl-fbo)
+           'cl-libmpv-cffi.binding::w)
+          width
+          (cffi:foreign-slot-value
+           fbo-params '(:struct cl-libmpv-cffi.binding:mpv-opengl-fbo)
+           'cl-libmpv-cffi.binding::h)
+          height
+          (cffi:foreign-slot-value
+           fbo-params '(:struct cl-libmpv-cffi.binding:mpv-opengl-fbo)
+           'cl-libmpv-cffi.binding::internal-format)
+          internal-format)
+    (cffi:with-foreign-object
+        (params '(:struct cl-libmpv-cffi.binding:mpv-render-param) 7)
+      (let ((index 0))
+        (%set-render-param params index :opengl-fbo fbo-params)
+        (incf index)
+        (cffi:with-foreign-objects ((flip-y-ptr :int)
+                                    (depth-ptr :int)
+                                    (block-ptr :int)
+                                    (skip-ptr :int))
+          (when flip-y
+            (setf (cffi:mem-ref flip-y-ptr :int) (if flip-y 1 0))
+            (%set-render-param params index :flip-y flip-y-ptr)
+            (incf index))
+          (when depth
+            (setf (cffi:mem-ref depth-ptr :int) depth)
+            (%set-render-param params index :depth depth-ptr)
+            (incf index))
+          (when block-for-target-time
+            (setf (cffi:mem-ref block-ptr :int)
+                  (if block-for-target-time 1 0))
+            (%set-render-param params index :block-for-target-time block-ptr)
+            (incf index))
+          (when skip-rendering
+            (setf (cffi:mem-ref skip-ptr :int) (if skip-rendering 1 0))
+            (%set-render-param params index :skip-rendering skip-ptr)
+            (incf index))
+          (%terminate-render-params params index)
+          (%check-error
+           (cl-libmpv-cffi.binding:mpv-render-context-render
+            (%ensure-render-context render-context)
+            params)))))))
+
+(defun render-context-report-swap (render-context)
+  (cl-libmpv-cffi.binding:mpv-render-context-report-swap
+   (%ensure-render-context render-context))
+  nil)
 
 (defun %nullable-string (ptr)
   (unless (cffi:null-pointer-p ptr)

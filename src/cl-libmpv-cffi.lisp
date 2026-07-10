@@ -31,6 +31,16 @@
    #:wakeup
    #:wait-async-requests
    #:hook-add
-   #:hook-continue))
+   #:hook-continue
+   #:mpv-render-context
+   #:make-opengl-render-context
+   #:with-opengl-render-context
+   #:destroy-render-context
+   #:render-context-destroyed-p
+   #:set-render-update-callback
+   #:render-context-update
+   #:render-context-next-frame-info
+   #:render-opengl
+   #:render-context-report-swap))
 
 (in-package :cl-libmpv-cffi)
