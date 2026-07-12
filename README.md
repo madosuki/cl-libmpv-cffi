@@ -38,4 +38,5 @@ For headless tests, use null outputs:
           (cl-libmpv-cffi:client-id player)))
 ```
 
-more detail here https://github.com/madosuki/cl-libmpv-cffi/blob/main/examples/run-loadfile.lisp
+more detail here https://github.com/madosuki/cl-libmpv-cffi/blob/main/examples/run-loadfile.lisp  
+And when vo=libmpv case example here https://github.com/madosuki/cl-mpv-frontend
