@@ -3,7 +3,7 @@ unofficial wrapper of libmpv for Common Lisp.
 
 tested only SBCL.
 
-## before usage
+## before using
 ``` shell
 ros install madosuki/cl-lbmpv-cffi
 ```
