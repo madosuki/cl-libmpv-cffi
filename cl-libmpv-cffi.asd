@@ -7,7 +7,7 @@
   :name "cl-libmpv-cffi"
   :version "0.0.1"
   :author "madosuki"
-  :license "MIT"
+  :license "LGPL-2.1"
   :description "wrapper and binding of libmpv"
   :serial t
   :depends-on ("cffi" "cffi-libffi")
